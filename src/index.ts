@@ -336,13 +336,6 @@ export async function init(router: Router): Promise<void> {
             settings.disabledServers = disabledServers;
             writeMcpSettings(request.user.directories, settings);
 
-            // Stop any running servers that are now disabled
-            disabledServers.forEach(serverName => {
-                if (mcpClients.has(serverName)) {
-                    stopMcpServer(serverName);
-                }
-            });
-
             response.json({});
         } catch (error) {
             console.error('[MCP] Error updating disabled servers:', error);
