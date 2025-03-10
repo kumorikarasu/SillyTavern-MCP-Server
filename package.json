@@ -1,0 +1,39 @@
+{
+    "name": "sillytavern-mcp-server",
+    "version": "1.0.0",
+    "description": "Server plugin for SillyTavern using MCP",
+    "main": "dist/index.js",
+    "type": "commonjs",
+    "scripts": {
+        "dev": "webpack --mode development",
+        "prod": "webpack --mode production"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/SillyTavern/SillyTavern-DiscordRichPresence-Server.git"
+    },
+    "keywords": [
+        "sillytavern"
+    ],
+    "author": "bmen25124",
+    "license": "MIT",
+    "bugs": {
+        "url": "https://github.com/SillyTavern/SillyTavern-DiscordRichPresence-Server/issues"
+    },
+    "homepage": "https://github.com/SillyTavern/SillyTavern-DiscordRichPresence-Server#readme",
+    "devDependencies": {
+        "@eslint/js": "^9.17.0",
+        "@types/express": "^5.0.0",
+        "@types/write-file-atomic": "^4.0.3",
+        "terser-webpack-plugin": "^5.3.11",
+        "ts-loader": "^9.5.1",
+        "typescript": "^5.7.2",
+        "typescript-eslint": "^8.18.2",
+        "utf-8-validate": "^5.0.10",
+        "webpack": "^5.97.1",
+        "webpack-cli": "^6.0.1"
+    },
+    "dependencies": {
+        "write-file-atomic": "^6.0.0"
+    }
+}
