@@ -287,7 +287,7 @@ export async function init(router: Router): Promise<void> {
             settings.mcpServers[name] = config;
             writeMcpSettings(request.user.directories, settings);
 
-            response.json({ success: true });
+            response.json({});
         } catch (error) {
             console.error('[MCP] Error adding/updating server:', error);
             response.status(500).json({ error: 'Failed to add/update MCP server' });
@@ -313,7 +313,7 @@ export async function init(router: Router): Promise<void> {
                 writeMcpSettings(request.user.directories, settings);
             }
 
-            response.json({ success: true });
+            response.json({});
         } catch (error) {
             console.error('[MCP] Error deleting server:', error);
             response.status(500).json({ error: 'Failed to delete MCP server' });
@@ -343,7 +343,7 @@ export async function init(router: Router): Promise<void> {
                 }
             });
 
-            response.json({ success: true });
+            response.json({});
         } catch (error) {
             console.error('[MCP] Error updating disabled servers:', error);
             response.status(500).json({ error: 'Failed to update disabled servers' });
@@ -369,11 +369,10 @@ export async function init(router: Router): Promise<void> {
 
             startMcpServer(name, config)
                 .then(success => {
-                    if (success) {
-                        response.json({ success: true });
-                    } else {
-                        response.status(500).json({ error: 'Failed to start MCP server' });
+                    if (!success) {
+                        return response.status(500).json({ error: 'Failed to start MCP server' });
                     }
+                    response.json({});
                 })
                 .catch(error => {
                     console.error('[MCP] Error starting server:', error);
@@ -397,11 +396,10 @@ export async function init(router: Router): Promise<void> {
 
             stopMcpServer(name)
                 .then(success => {
-                    if (success) {
-                        response.json({ success: true });
-                    } else {
-                        response.status(500).json({ error: 'Failed to stop MCP server' });
+                    if (!success) {
+                        return response.status(500).json({ error: 'Failed to stop MCP server' });
                     }
+                    response.json({});
                 })
                 .catch(error => {
                     console.error('[MCP] Error stopping server:', error);
@@ -474,7 +472,7 @@ export async function init(router: Router): Promise<void> {
             settings.disabledTools[name] = disabledTools;
             writeMcpSettings(request.user.directories, settings);
 
-            response.json({ success: true });
+            response.json({});
         } catch (error) {
             console.error('[MCP] Error updating disabled tools:', error);
             response.status(500).json({ error: 'Failed to update disabled tools' });
@@ -549,7 +547,6 @@ export async function init(router: Router): Promise<void> {
                 });
 
                 response.json({
-                    success: true,
                     result: {
                         toolName,
                         status: 'executed',
@@ -559,7 +556,6 @@ export async function init(router: Router): Promise<void> {
             } catch (error: any) {
                 console.error('[MCP] Error executing tool:', error);
                 response.status(500).json({
-                    success: false,
                     error: `Failed to execute tool: ${error.message}`,
                 });
             }
