@@ -10,7 +10,7 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/SillyTavern/SillyTavern-DiscordRichPresence-Server.git"
+        "url": "git+https://github.com/SillyTavern/bmen25124/SillyTavern-MCP-Server.git"
     },
     "keywords": [
         "sillytavern"
@@ -18,9 +18,9 @@
     "author": "bmen25124",
     "license": "MIT",
     "bugs": {
-        "url": "https://github.com/SillyTavern/SillyTavern-DiscordRichPresence-Server/issues"
+        "url": "https://github.com/SillyTavern/bmen25124/SillyTavern-MCP-Server/issues"
     },
-    "homepage": "https://github.com/SillyTavern/SillyTavern-DiscordRichPresence-Server#readme",
+    "homepage": "https://github.com/SillyTavern/bmen25124/SillyTavern-MCP-Server#readme",
     "devDependencies": {
         "@eslint/js": "^9.17.0",
         "@types/express": "^5.0.0",

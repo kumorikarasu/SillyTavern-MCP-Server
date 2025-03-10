@@ -6,6 +6,8 @@ import { URL } from 'node:url';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { Router, Request as ExpressRequest, Response, json } from 'express';
 
+const ID = 'mcp';
+
 // Extend the Express Request type to include user property
 interface Request extends ExpressRequest {
     user: {
@@ -785,8 +787,8 @@ export default {
     init,
     exit: (): void => {},
     info: {
-        id: 'mcp',
+        id: ID,
         name: 'MCP Server',
-        description: 'My cool plugin!',
+        description: 'Allows you to connect to an MCP server and execute tools',
     } as PluginInfo,
 };
