@@ -35,6 +35,7 @@ interface McpServerDictionary {
     mcpServers: Record<string, McpServerEntry>;
     disabledTools: Record<string, string[]>; // Map of server names to their disabled tools
     disabledServers: string[]; // Array of disabled server names
+    cachedTools: Record<string, any[]>; // Map of server names to their cached tool data
 }
 
 interface UserDirectoryList {
@@ -56,7 +57,8 @@ export function readMcpSettings(directories: UserDirectoryList): McpServerDictio
         const defaultSettings: McpServerDictionary = {
             mcpServers: {},
             disabledTools: {},
-            disabledServers: []
+            disabledServers: [],
+            cachedTools: {}
         };
         writeFileAtomicSync(filePath, JSON.stringify(defaultSettings, null, 4), 'utf-8');
         return defaultSettings;
@@ -71,6 +73,9 @@ export function readMcpSettings(directories: UserDirectoryList): McpServerDictio
     }
     if (!settings.disabledServers) {
         settings.disabledServers = [];
+    }
+    if (!settings.cachedTools) {
+        settings.cachedTools = {};
     }
 
     return settings;
@@ -194,6 +199,7 @@ export async function init(router: Router): Promise<void> {
                 },
                 disabledTools: settings.disabledTools[name] || [],
                 enabled: !settings.disabledServers.includes(name),
+                cachedTools: settings.cachedTools[name] || [],
             }));
 
             response.json(servers);
@@ -364,15 +370,37 @@ export async function init(router: Router): Promise<void> {
             response.status(500).json({ error: 'Failed to stop MCP server' });
         }
     });
-
     // List tools from an MCP server
     // @ts-ignore
     router.get('/servers/:name/list-tools', async (request: Request, response: Response) => {
         try {
             const { name } = request.params;
+            const settings = readMcpSettings(request.user.directories);
 
+            if (!settings.mcpServers || !settings.mcpServers[name]) {
+                return response.status(404).json({ error: 'Server not found' });
+            }
+
+            const disabledTools = settings.disabledTools[name] || [];
+            const cachedTools = settings.cachedTools[name] || [];
+
+            // If we have cached tools, use them
+            if (cachedTools.length > 0) {
+                const toolsWithStatus = cachedTools.map(tool => ({
+                    ...tool,
+                    _enabled: !disabledTools.includes(tool.name),
+                }));
+                return response.json(toolsWithStatus);
+            }
+
+            // No cached tools, need to get them from server
+            const wasRunning = mcpClients.has(name);
             if (!mcpClients.has(name)) {
-                return response.status(400).json({ error: 'Server is not running' });
+                // Try to start server temporarily
+                const success = await startMcpServer(name, settings.mcpServers[name]);
+                if (!success) {
+                    return response.status(500).json({ error: 'Failed to start server temporarily' });
+                }
             }
 
             const client = mcpClients.get(name);
@@ -382,17 +410,27 @@ export async function init(router: Router): Promise<void> {
             try {
                 // Use the MCP SDK to list tools
                 const tools = await client?.listTools();
-                const settings = readMcpSettings(request.user.directories);
-                const disabledTools = settings.disabledTools[name] || [];
-
-                // Add enabled status to each tool
                 const toolsWithStatus = tools?.tools.map((tool: { name: string; }) => ({
                     ...tool,
                     _enabled: !disabledTools.includes(tool.name),
                 }));
 
+                // Cache tools
+                settings.cachedTools[name] = tools?.tools || [];
+                writeMcpSettings(request.user.directories, settings);
+
+                if (!wasRunning) {
+                    // Stop the server if we started it temporarily
+                    await stopMcpServer(name);
+                }
+
                 response.json(toolsWithStatus || []);
             } catch (error: any) {
+                if (!wasRunning && mcpClients.has(name)) {
+                    // Stop the server if we started it temporarily
+                    await stopMcpServer(name);
+                }
+
                 console.error('[MCP] Error listing tools:', error);
                 response.status(500).json({ error: `Failed to list tools: ${error.message}` });
             }
