@@ -33,6 +33,8 @@ interface McpServerEntry {
 
 interface McpServerDictionary {
     mcpServers: Record<string, McpServerEntry>;
+    disabledTools: Record<string, string[]>; // Map of server names to their disabled tools
+    disabledServers: string[]; // Array of disabled server names
 }
 
 interface UserDirectoryList {
@@ -50,15 +52,28 @@ export const MCP_SETTINGS_FILE = 'mcp_settings.json';
  */
 export function readMcpSettings(directories: UserDirectoryList): McpServerDictionary {
     const filePath = path.join(directories.root, MCP_SETTINGS_FILE);
-
     if (!fs.existsSync(filePath)) {
-        const defaultSettings: McpServerDictionary = { mcpServers: {} };
+        const defaultSettings: McpServerDictionary = {
+            mcpServers: {},
+            disabledTools: {},
+            disabledServers: []
+        };
         writeFileAtomicSync(filePath, JSON.stringify(defaultSettings, null, 4), 'utf-8');
         return defaultSettings;
     }
 
     const fileContents = fs.readFileSync(filePath, 'utf-8');
-    return JSON.parse(fileContents) as McpServerDictionary;
+    const settings = JSON.parse(fileContents) as McpServerDictionary;
+
+    // Migration: Add missing fields if they don't exist
+    if (!settings.disabledTools) {
+        settings.disabledTools = {};
+    }
+    if (!settings.disabledServers) {
+        settings.disabledServers = [];
+    }
+
+    return settings;
 }
 
 /**
@@ -177,6 +192,8 @@ export async function init(router: Router): Promise<void> {
                     args: config.args,
                     // Don't send environment variables for security
                 },
+                disabledTools: settings.disabledTools[name] || [],
+                enabled: !settings.disabledServers.includes(name),
             }));
 
             response.json(servers);
@@ -238,14 +255,13 @@ export async function init(router: Router): Promise<void> {
 
             if (mcpClients.has(name)) {
                 stopMcpServer(name);
-            } else {
-                return response.status(404).json({ error: 'Server not found' });
             }
 
             const settings = readMcpSettings(request.user.directories);
 
             if (settings.mcpServers && settings.mcpServers[name]) {
                 delete settings.mcpServers[name];
+                delete settings.disabledTools[name];
                 writeMcpSettings(request.user.directories, settings);
             }
 
@@ -253,6 +269,36 @@ export async function init(router: Router): Promise<void> {
         } catch (error) {
             console.error('[MCP] Error deleting server:', error);
             response.status(500).json({ error: 'Failed to delete MCP server' });
+        }
+    });
+
+    // Update disabled servers
+    // @ts-ignore
+    router.post('/servers/disabled', jsonParser, (request: Request, response: Response) => {
+        try {
+            const { disabledServers } = request.body;
+
+            if (!Array.isArray(disabledServers)) {
+                return response.status(400).json({ error: 'disabledServers must be an array of server names' });
+            }
+
+            const settings = readMcpSettings(request.user.directories);
+
+            // Update disabled servers
+            settings.disabledServers = disabledServers;
+            writeMcpSettings(request.user.directories, settings);
+
+            // Stop any running servers that are now disabled
+            disabledServers.forEach(serverName => {
+                if (mcpClients.has(serverName)) {
+                    stopMcpServer(serverName);
+                }
+            });
+
+            response.json({ success: true });
+        } catch (error) {
+            console.error('[MCP] Error updating disabled servers:', error);
+            response.status(500).json({ error: 'Failed to update disabled servers' });
         }
     });
 
@@ -265,6 +311,10 @@ export async function init(router: Router): Promise<void> {
 
             if (!settings.mcpServers || !settings.mcpServers[name]) {
                 return response.status(404).json({ error: 'Server not found' });
+            }
+
+            if (settings.disabledServers.includes(name)) {
+                return response.status(403).json({ error: 'Server is disabled' });
             }
 
             const config = settings.mcpServers[name];
@@ -332,7 +382,16 @@ export async function init(router: Router): Promise<void> {
             try {
                 // Use the MCP SDK to list tools
                 const tools = await client?.listTools();
-                response.json(tools?.tools || []);
+                const settings = readMcpSettings(request.user.directories);
+                const disabledTools = settings.disabledTools[name] || [];
+
+                // Add enabled status to each tool
+                const toolsWithStatus = tools?.tools.map((tool: { name: string; }) => ({
+                    ...tool,
+                    _enabled: !disabledTools.includes(tool.name),
+                }));
+
+                response.json(toolsWithStatus || []);
             } catch (error: any) {
                 console.error('[MCP] Error listing tools:', error);
                 response.status(500).json({ error: `Failed to list tools: ${error.message}` });
@@ -340,6 +399,34 @@ export async function init(router: Router): Promise<void> {
         } catch (error) {
             console.error('[MCP] Error listing tools:', error);
             response.status(500).json({ error: 'Failed to list tools from MCP server' });
+        }
+    });
+
+    // Update disabled tools for a server
+    // @ts-ignore
+    router.post('/servers/:name/disabled-tools', jsonParser, async (request: Request, response: Response) => {
+        try {
+            const { name } = request.params;
+            const { disabledTools } = request.body;
+
+            if (!Array.isArray(disabledTools)) {
+                return response.status(400).json({ error: 'disabledTools must be an array of tool names' });
+            }
+
+            const settings = readMcpSettings(request.user.directories);
+
+            if (!settings.mcpServers || !settings.mcpServers[name]) {
+                return response.status(404).json({ error: 'Server not found' });
+            }
+
+            // Update disabled tools
+            settings.disabledTools[name] = disabledTools;
+            writeMcpSettings(request.user.directories, settings);
+
+            response.json({ success: true });
+        } catch (error) {
+            console.error('[MCP] Error updating disabled tools:', error);
+            response.status(500).json({ error: 'Failed to update disabled tools' });
         }
     });
 
@@ -360,6 +447,14 @@ export async function init(router: Router): Promise<void> {
 
             if (!toolArgs || typeof toolArgs !== 'object') {
                 return response.status(400).json({ error: 'Tool arguments must be an object' });
+            }
+
+            // Check if the tool is enabled
+            const settings = readMcpSettings(request.user.directories);
+            const disabledTools = settings.disabledTools[name] || [];
+
+            if (disabledTools.includes(toolName)) {
+                return response.status(403).json({ error: 'This tool is disabled' });
             }
 
             const client = mcpClients.get(name);
@@ -403,7 +498,7 @@ interface PluginInfo {
 
 export default {
     init,
-    exit: (): void => {},
+    exit: (): void => { },
     info: {
         id: ID,
         name: 'MCP Server',
