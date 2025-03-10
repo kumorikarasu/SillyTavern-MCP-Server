@@ -163,6 +163,47 @@ async function startMcpServer(serverName: string, config: McpServerEntry): Promi
 }
 
 /**
+ * Reloads tool cache for a specific server
+ */
+async function reloadToolCache(serverName: string, settings: McpServerDictionary, directories: UserDirectoryList): Promise<{ success: boolean; tools: any[] }> {
+    const wasRunning = mcpClients.has(serverName);
+
+    try {
+        if (!mcpClients.has(serverName)) {
+            // Try to start server temporarily
+            const success = await startMcpServer(serverName, settings.mcpServers[serverName]);
+            if (!success) {
+                return { success: false, tools: [] };
+            }
+        }
+
+        const client = mcpClients.get(serverName);
+        console.log(`[MCP] Reloading tool cache from server "${serverName}"`);
+
+        // Use the MCP SDK to list tools
+        const tools = await client?.listTools();
+
+        // Cache tools
+        settings.cachedTools[serverName] = tools?.tools || [];
+        writeMcpSettings(directories, settings);
+
+        if (!wasRunning) {
+            // Stop the server if we started it temporarily
+            await stopMcpServer(serverName);
+        }
+
+        return { success: true, tools: tools?.tools || [] };
+    } catch (error) {
+        if (!wasRunning && mcpClients.has(serverName)) {
+            // Stop the server if we started it temporarily
+            await stopMcpServer(serverName);
+        }
+        console.error('[MCP] Error reloading tool cache:', error);
+        return { success: false, tools: [] };
+    }
+}
+
+/**
  * Stops an MCP server process
  */
 async function stopMcpServer(serverName: string): Promise<boolean> {
@@ -268,6 +309,7 @@ export async function init(router: Router): Promise<void> {
             if (settings.mcpServers && settings.mcpServers[name]) {
                 delete settings.mcpServers[name];
                 delete settings.disabledTools[name];
+                delete settings.cachedTools[name];
                 writeMcpSettings(request.user.directories, settings);
             }
 
@@ -393,47 +435,18 @@ export async function init(router: Router): Promise<void> {
                 return response.json(toolsWithStatus);
             }
 
-            // No cached tools, need to get them from server
-            const wasRunning = mcpClients.has(name);
-            if (!mcpClients.has(name)) {
-                // Try to start server temporarily
-                const success = await startMcpServer(name, settings.mcpServers[name]);
-                if (!success) {
-                    return response.status(500).json({ error: 'Failed to start server temporarily' });
-                }
+            // Try to reload tool cache
+            const { success, tools: reloadedTools } = await reloadToolCache(name, settings, request.user.directories);
+            if (!success) {
+                return response.status(500).json({ error: 'Failed to reload tool cache' });
             }
 
-            const client = mcpClients.get(name);
+            const toolsWithStatus = reloadedTools.map((tool: { name: string; }) => ({
+                ...tool,
+                _enabled: !disabledTools.includes(tool.name),
+            }));
 
-            console.log(`[MCP] Listing tools from server "${name}"`);
-
-            try {
-                // Use the MCP SDK to list tools
-                const tools = await client?.listTools();
-                const toolsWithStatus = tools?.tools.map((tool: { name: string; }) => ({
-                    ...tool,
-                    _enabled: !disabledTools.includes(tool.name),
-                }));
-
-                // Cache tools
-                settings.cachedTools[name] = tools?.tools || [];
-                writeMcpSettings(request.user.directories, settings);
-
-                if (!wasRunning) {
-                    // Stop the server if we started it temporarily
-                    await stopMcpServer(name);
-                }
-
-                response.json(toolsWithStatus || []);
-            } catch (error: any) {
-                if (!wasRunning && mcpClients.has(name)) {
-                    // Stop the server if we started it temporarily
-                    await stopMcpServer(name);
-                }
-
-                console.error('[MCP] Error listing tools:', error);
-                response.status(500).json({ error: `Failed to list tools: ${error.message}` });
-            }
+            response.json(toolsWithStatus || []);
         } catch (error) {
             console.error('[MCP] Error listing tools:', error);
             response.status(500).json({ error: 'Failed to list tools from MCP server' });
@@ -465,6 +478,35 @@ export async function init(router: Router): Promise<void> {
         } catch (error) {
             console.error('[MCP] Error updating disabled tools:', error);
             response.status(500).json({ error: 'Failed to update disabled tools' });
+        }
+    });
+
+    // Reload tool cache for a server
+    // @ts-ignore
+    router.post('/servers/:name/reload-tools', async (request: Request, response: Response) => {
+        try {
+            const { name } = request.params;
+            const settings = readMcpSettings(request.user.directories);
+
+            if (!settings.mcpServers || !settings.mcpServers[name]) {
+                return response.status(404).json({ error: 'Server not found' });
+            }
+
+            const { success, tools } = await reloadToolCache(name, settings, request.user.directories);
+            if (!success) {
+                return response.status(500).json({ error: 'Failed to reload tool cache' });
+            }
+
+            const disabledTools = settings.disabledTools[name] || [];
+            const toolsWithStatus = tools.map((tool: { name: string; }) => ({
+                ...tool,
+                _enabled: !disabledTools.includes(tool.name),
+            }));
+
+            response.json(toolsWithStatus);
+        } catch (error) {
+            console.error('[MCP] Error reloading tool cache:', error);
+            response.status(500).json({ error: 'Failed to reload tool cache' });
         }
     });
 
