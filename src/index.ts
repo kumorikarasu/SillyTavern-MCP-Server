@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { MCP_SETTINGS_FILE, mcpInit, readMcpSettings, Request } from './mcp';
 import path from 'node:path';
-const { exec } = require('child_process');
+import { exec } from 'child_process';
 
 const ID = 'mcp';
 

@@ -5,9 +5,9 @@ import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { URL } from 'node:url';
 
 // Use require for MCP SDK
-const { Client } = require('@modelcontextprotocol/sdk/client/index.js');
-const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
-const { SSEClientTransport } = require('@modelcontextprotocol/sdk/client/sse.js');
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 
 // Extend the Express Request type to include user property
 export interface Request extends ExpressRequest {
@@ -42,7 +42,7 @@ interface McpServerDictionary {
 }
 
 // Map to store MCP clients
-const mcpClients: Map<string, typeof Client> = new Map();
+const mcpClients: Map<string, Client> = new Map();
 
 export const MCP_SETTINGS_FILE = 'mcp_settings.json';
 

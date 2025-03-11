@@ -24,16 +24,9 @@ const serverConfig = {
         ],
     },
     optimization: {
-        minimizer: [
-            new TerserPlugin({
-                extractComments: false,
-                terserOptions: {
-                    format: {
-                        comments: false,
-                    },
-                },
-            }),
-        ],
+        minimizer: [new TerserPlugin({
+            extractComments: false,
+        })],
     },
     plugins: [],
 };
