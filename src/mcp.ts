@@ -502,13 +502,20 @@ export async function mcpInit(router: Router): Promise<void> {
             }
 
             const client = mcpClients.get(name);
+            const tool = settings.cachedTools[name]?.find(t => t.name === toolName);
+
+            if (!tool) {
+                return response.status(404).json({ error: 'Tool not found' });
+            }
+
+            const schema = tool.inputSchema;
             console.log(`[MCP] Calling tool "${toolName}" on server "${name}" with arguments:`, toolArgs);
 
             try {
                 const result = await client?.callTool({
                     name: toolName,
                     arguments: toolArgs,
-                });
+                }, schema);
 
                 response.json({
                     result: {

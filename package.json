@@ -34,6 +34,7 @@
         "webpack-cli": "^6.0.1"
     },
     "dependencies": {
+        "jsonschema": "^1.5.0",
         "write-file-atomic": "^6.0.0"
     }
 }

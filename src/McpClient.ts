@@ -1,3 +1,5 @@
+import { Validator } from "jsonschema";
+
 import child_process from 'node:child_process';
 import EventEmitter from 'node:events';
 
@@ -209,7 +211,8 @@ export class McpClient extends EventEmitter {
         return this.sendRequest('tools/list', {});
     }
 
-    public async callTool(params: { name: string; arguments: any }): Promise<any> {
+    public async callTool(params: { name: string; arguments: any }, schema: any): Promise<any> {
+        new Validator().validate(params.arguments, schema, { throwError: true });
         return this.sendRequest('tools/call', params);
     }
 
