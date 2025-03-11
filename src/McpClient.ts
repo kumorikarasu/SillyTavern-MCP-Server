@@ -345,6 +345,9 @@ export class McpClient extends EventEmitter {
                 ));
                 return;
             }
+
+            pending.resolve(result);
+            return;
         }
 
         if ('error' in message && message.error) {
