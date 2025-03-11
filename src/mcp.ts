@@ -2,12 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { Router, Request as ExpressRequest, Response, json } from 'express';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
-import { URL } from 'node:url';
-
-// Use require for MCP SDK
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+import { McpClient, Implementation, McpError, ErrorCode } from './McpClient';
 
 // Extend the Express Request type to include user property
 export interface Request extends ExpressRequest {
@@ -42,7 +37,7 @@ interface McpServerDictionary {
 }
 
 // Map to store MCP clients
-const mcpClients: Map<string, Client> = new Map();
+const mcpClients: Map<string, McpClient> = new Map();
 
 export const MCP_SETTINGS_FILE = 'mcp_settings.json';
 
@@ -88,7 +83,17 @@ export function writeMcpSettings(directories: UserDirectoryList, settings: McpSe
 }
 
 /**
- * Starts an MCP server process and connects to it using the MCP SDK
+ * Creates a client configuration for a server
+ */
+function createClientInfo(serverName: string): Implementation {
+    return {
+        name: `sillytavern-${serverName}-client`,
+        version: '1.0.0'
+    };
+}
+
+/**
+ * Starts an MCP server process and connects to it using JSON-RPC
  */
 async function startMcpServer(serverName: string, config: McpServerEntry) {
     if (mcpClients.has(serverName)) {
@@ -96,22 +101,6 @@ async function startMcpServer(serverName: string, config: McpServerEntry) {
         return;
     }
 
-    // Create an MCP client
-    const client = new Client(
-        {
-            name: 'sillytavern-client',
-            version: '1.0.0',
-        },
-        {
-            capabilities: {
-                prompts: {},
-                resources: {},
-                tools: {},
-            },
-        },
-    );
-
-    let transport;
     const transportType = config.type || 'stdio';
 
     if (transportType === 'stdio') {
@@ -128,30 +117,34 @@ async function startMcpServer(serverName: string, config: McpServerEntry) {
             console.log(`[MCP] Windows detected, wrapping command: cmd /C ${originalCommand} ${originalArgs.join(' ')}`);
         }
 
-        transport = new StdioClientTransport({
-            command: command,
-            args: args,
-            env: env,
-        });
+        const client = new McpClient(
+            {
+                command,
+                args,
+                env,
+            },
+            createClientInfo(serverName),
+            {
+                tools: { listChanged: true }
+            }
+        );
 
-        console.log(`[MCP] Using stdio transport for server "${serverName}"`);
-    } else if (transportType === 'sse') {
-        if (!config.url) {
-            throw new Error('URL is required for SSE transport');
+        try {
+            await client.connect();
+            mcpClients.set(serverName, client);
+            console.log(`[MCP] Connected to server "${serverName}" using JSON-RPC with stdio transport`);
+        } catch (error: any) {
+            throw new McpError(
+                ErrorCode.ConnectionClosed,
+                `Failed to connect to server: ${error.message}`
+            );
         }
-
-        transport = new SSEClientTransport(new URL(config.url));
-
-        console.log(`[MCP] Using SSE transport for server "${serverName}" with URL: ${config.url}`);
     } else {
-        throw new Error(`Unsupported transport type: ${transportType}`);
+        throw new McpError(
+            ErrorCode.InvalidRequest,
+            `Unsupported transport type: ${transportType}`
+        );
     }
-
-    // Connect to the server
-    await client.connect(transport);
-    mcpClients.set(serverName, client);
-
-    console.log(`[MCP] Connected to server "${serverName}" using MCP SDK with ${transportType} transport`);
 }
 
 /**
@@ -169,7 +162,6 @@ async function reloadToolCache(serverName: string, settings: McpServerDictionary
         const client = mcpClients.get(serverName);
         console.log(`[MCP] Reloading tool cache from server "${serverName}"`);
 
-        // Use the MCP SDK to list tools
         const tools = await client?.listTools();
 
         // Cache tools
@@ -189,6 +181,7 @@ async function reloadToolCache(serverName: string, settings: McpServerDictionary
                 await stopMcpServer(serverName);
             }
         } catch (error) {
+            // Ignore error during cleanup
         }
 
         console.error('[MCP] Error reloading tool cache:', error);
@@ -217,18 +210,22 @@ export async function mcpInit(router: Router): Promise<void> {
     router.get('/servers', (request: Request, response: Response) => {
         try {
             const settings = readMcpSettings(request.user.directories);
-            const servers = Object.entries(settings.mcpServers || {}).map(([name, config]) => ({
-                name,
-                isRunning: mcpClients.has(name),
-                config: {
-                    command: config.command,
-                    args: config.args,
-                    // Don't send environment variables for security
-                },
-                disabledTools: settings.disabledTools[name] || [],
-                enabled: !settings.disabledServers.includes(name),
-                cachedTools: settings.cachedTools[name] || [],
-            }));
+            const servers = Object.entries(settings.mcpServers || {}).map(([name, config]) => {
+                const client = mcpClients.get(name);
+                return {
+                    name,
+                    isRunning: mcpClients.has(name),
+                    config: {
+                        command: config.command,
+                        args: config.args,
+                        // Don't send environment variables for security
+                    },
+                    capabilities: client?.getCapabilities(),
+                    disabledTools: settings.disabledTools[name] || [],
+                    enabled: !settings.disabledServers.includes(name),
+                    cachedTools: settings.cachedTools[name] || [],
+                };
+            });
 
             response.json(servers);
         } catch (error: any) {
@@ -256,10 +253,6 @@ export async function mcpInit(router: Router): Promise<void> {
             if (transportType === 'stdio') {
                 if (!config.command || typeof config.command !== 'string') {
                     return response.status(400).json({ error: 'Server command is required for stdio transport' });
-                }
-            } else if (transportType === 'sse') {
-                if (!config.url || typeof config.url !== 'string') {
-                    return response.status(400).json({ error: 'Server URL is required for SSE transport' });
                 }
             } else {
                 return response.status(400).json({ error: `Unsupported transport type: ${transportType}` });
@@ -388,6 +381,7 @@ export async function mcpInit(router: Router): Promise<void> {
             response.status(500).json({ error: error?.message || 'Failed to stop MCP server' });
         }
     });
+
     // List tools from an MCP server
     // @ts-ignore
     router.get('/servers/:name/list-tools', async (request: Request, response: Response) => {
@@ -508,11 +502,9 @@ export async function mcpInit(router: Router): Promise<void> {
             }
 
             const client = mcpClients.get(name);
-
             console.log(`[MCP] Calling tool "${toolName}" on server "${name}" with arguments:`, toolArgs);
 
             try {
-                // Use the MCP SDK to call the tool
                 const result = await client?.callTool({
                     name: toolName,
                     arguments: toolArgs,
@@ -526,10 +518,18 @@ export async function mcpInit(router: Router): Promise<void> {
                     },
                 });
             } catch (error: any) {
-                console.error('[MCP] Error executing tool:', error);
-                response.status(500).json({
-                    error: error?.message || 'Failed to execute tool',
-                });
+                if (error instanceof McpError) {
+                    response.status(500).json({
+                        error: error.message,
+                        code: error.code,
+                        data: error.data
+                    });
+                } else {
+                    response.status(500).json({
+                        error: error?.message || 'Failed to execute tool',
+                        code: ErrorCode.InternalError
+                    });
+                }
             }
         } catch (error: any) {
             console.error('[MCP] Error calling tool:', error);
