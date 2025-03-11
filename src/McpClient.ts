@@ -4,11 +4,13 @@ import child_process from 'node:child_process';
 import EventEmitter from 'node:events';
 
 const JSONRPC_VERSION = "2.0";
+const PROTOCOL_VERSION = "2024-11-05";
 
 export enum ErrorCode {
     // SDK error codes
     ConnectionClosed = -32000,
     RequestTimeout = -32001,
+    UnsupportedProtocolVersion = -32002,
 
     // Standard JSON-RPC error codes
     ParseError = -32700,
@@ -18,9 +20,12 @@ export enum ErrorCode {
     InternalError = -32603,
 }
 
+export type RequestId = string | number;
+export type ProgressToken = string | number;
+
 export interface ClientCapabilities {
     experimental?: Record<string, any>;
-    sampling?: Record<string, any>;
+    sampling?: object;
     roots?: {
         listChanged?: boolean;
     };
@@ -31,7 +36,7 @@ export interface ClientCapabilities {
 
 export interface ServerCapabilities {
     experimental?: Record<string, any>;
-    logging?: Record<string, any>;
+    logging?: object;
     prompts?: {
         listChanged?: boolean;
     };
@@ -49,17 +54,28 @@ export interface Implementation {
     version: string;
 }
 
+export interface RequestMetadata {
+    progressToken?: ProgressToken;
+    [key: string]: unknown;
+}
+
 export interface McpRequest {
     jsonrpc: typeof JSONRPC_VERSION;
-    id: number;
+    id: RequestId;
     method: string;
-    params?: Record<string, any>;
+    params?: {
+        _meta?: RequestMetadata;
+        [key: string]: unknown;
+    };
 }
 
 export interface McpResponse {
     jsonrpc: typeof JSONRPC_VERSION;
-    id: number;
-    result?: any;
+    id: RequestId;
+    result?: {
+        _meta?: { [key: string]: unknown };
+        [key: string]: unknown;
+    };
     error?: {
         code: number;
         message: string;
@@ -70,13 +86,23 @@ export interface McpResponse {
 export interface McpNotification {
     jsonrpc: typeof JSONRPC_VERSION;
     method: string;
-    params?: Record<string, any>;
+    params?: {
+        _meta?: { [key: string]: unknown };
+        [key: string]: unknown;
+    };
 }
 
 export interface McpClientConfig {
     command: string;
     args?: string[];
     env?: Record<string, string>;
+}
+
+export interface Annotated {
+    annotations?: {
+        audience?: ("user" | "assistant")[];
+        priority?: number;
+    };
 }
 
 export class McpError extends Error {
@@ -93,7 +119,11 @@ export class McpError extends Error {
 export class McpClient extends EventEmitter {
     private proc?: child_process.ChildProcess;
     private requestId: number = 0;
-    private pending: Map<number, { resolve: Function; reject: Function }> = new Map();
+    private pendingRequests: Map<RequestId, {
+        resolve: Function;
+        reject: Function;
+        method: string;
+    }> = new Map();
     private isConnected: boolean = false;
     private capabilities?: ServerCapabilities;
     private initializePromise?: Promise<void>;
@@ -166,10 +196,18 @@ export class McpClient extends EventEmitter {
 
                 // Initialize connection
                 this.sendRequest('initialize', {
-                    protocolVersion: '2024-11-05',
+                    protocolVersion: PROTOCOL_VERSION,
                     capabilities: this.clientCapabilities,
                     clientInfo: this.clientInfo,
-                }).then((result) => {
+                }).then((result: any) => {
+                    // Verify protocol version compatibility
+                    if (!this.isProtocolVersionSupported(result.protocolVersion)) {
+                        throw new McpError(
+                            ErrorCode.UnsupportedProtocolVersion,
+                            `Server protocol version ${result.protocolVersion} is not supported`
+                        );
+                    }
+
                     this.capabilities = result.capabilities;
                     this.isConnected = true;
 
@@ -182,6 +220,12 @@ export class McpClient extends EventEmitter {
         });
 
         return this.initializePromise;
+    }
+
+    private isProtocolVersionSupported(version: string): boolean {
+        // For now, we only support exact match
+        // In the future, we could implement semver comparison
+        return version === PROTOCOL_VERSION;
     }
 
     public async close(): Promise<void> {
@@ -216,7 +260,7 @@ export class McpClient extends EventEmitter {
         return this.sendRequest('tools/call', params);
     }
 
-    private async sendRequest(method: string, params: any): Promise<any> {
+    private async sendRequest(method: string, params: any, progressToken?: ProgressToken): Promise<any> {
         // For initialization requests, we don't want to check isConnected
         if (method !== 'initialize' && (!this.isConnected || !this.proc?.stdin)) {
             throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
@@ -228,10 +272,13 @@ export class McpClient extends EventEmitter {
                 jsonrpc: JSONRPC_VERSION,
                 id,
                 method,
-                params
+                params: {
+                    ...params,
+                    _meta: progressToken ? { progressToken } : undefined
+                }
             };
 
-            this.pending.set(id, { resolve, reject });
+            this.pendingRequests.set(id, { resolve, reject, method });
 
             if (!this.proc?.stdin) {
                 throw new McpError(ErrorCode.ConnectionClosed, 'Process stdin is not available');
@@ -248,7 +295,10 @@ export class McpClient extends EventEmitter {
         const notification: McpNotification = {
             jsonrpc: JSONRPC_VERSION,
             method,
-            params
+            params: params ? {
+                ...params,
+                _meta: {}
+            } : undefined
         };
 
         if (!this.proc?.stdin) {
@@ -264,13 +314,39 @@ export class McpClient extends EventEmitter {
             return;
         }
 
-        const pending = this.pending.get(message.id);
+        const pending = this.pendingRequests.get(message.id);
         if (!pending) {
             console.warn('Received response for unknown request:', message);
             return;
         }
 
-        this.pending.delete(message.id);
+        this.pendingRequests.delete(message.id);
+
+        // Handle tool call responses specially
+        if ('result' in message && pending.method === 'tools/call') {
+            // For example, MemoryMesh wraps their response with `toolResults`.
+            function findContentLevel(obj: any): any {
+                if (obj?.content === undefined) {
+                    // Check if there is only one property
+                    if (Object.keys(obj).length === 1) {
+                        return findContentLevel(obj[Object.keys(obj)[0]]);
+                    }
+                    return obj;
+                }
+                return obj;
+            }
+
+            const result = findContentLevel(message.result);
+            if (result?.isError) {
+                pending.reject(new McpError(
+                    ErrorCode.InternalError,
+                    result.content?.[0]?.text || 'Tool call failed',
+                    result
+                ));
+                return;
+            }
+        }
+
         if ('error' in message && message.error) {
             pending.reject(new McpError(
                 message.error.code,
