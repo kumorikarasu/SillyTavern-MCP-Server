@@ -329,7 +329,7 @@ export async function mcpInit(router: Router): Promise<void> {
 
     // Start an MCP server
     // @ts-ignore
-    router.post('/servers/:name/start', (request: Request, response: Response) => {
+    router.post('/servers/:name/start', async (request: Request, response: Response) => {
         try {
             const { name } = request.params;
             const settings = readMcpSettings(request.user.directories);
@@ -344,14 +344,8 @@ export async function mcpInit(router: Router): Promise<void> {
 
             const config = settings.mcpServers[name];
 
-            startMcpServer(name, config)
-                .then(() => {
-                    response.json({});
-                })
-                .catch(error => {
-                    console.error('[MCP] Error starting server:', error);
-                    response.status(500).json({ error: error?.message || 'Failed to start MCP server' });
-                });
+            await startMcpServer(name, config);
+            response.json({});
         } catch (error: any) {
             console.error('[MCP] Error starting server:', error);
             response.status(500).json({ error: error?.message || 'Failed to start MCP server' });
@@ -360,7 +354,7 @@ export async function mcpInit(router: Router): Promise<void> {
 
     // Stop an MCP server
     // @ts-ignore
-    router.post('/servers/:name/stop', (request: Request, response: Response) => {
+    router.post('/servers/:name/stop', async (request: Request, response: Response) => {
         try {
             const { name } = request.params;
 
@@ -368,14 +362,8 @@ export async function mcpInit(router: Router): Promise<void> {
                 return response.status(400).json({ error: 'Server is not running' });
             }
 
-            stopMcpServer(name)
-                .then(() => {
-                    response.json({});
-                })
-                .catch(error => {
-                    console.error('[MCP] Error stopping server:', error);
-                    response.status(500).json({ error: error?.message || 'Failed to stop MCP server' });
-                });
+            await stopMcpServer(name);
+            response.json({});
         } catch (error: any) {
             console.error('[MCP] Error stopping server:', error);
             response.status(500).json({ error: error?.message || 'Failed to stop MCP server' });

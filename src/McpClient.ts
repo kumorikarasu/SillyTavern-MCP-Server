@@ -1,7 +1,5 @@
 import { Validator } from "jsonschema";
-
 import child_process from 'node:child_process';
-import EventEmitter from 'node:events';
 
 const JSONRPC_VERSION = "2.0";
 const PROTOCOL_VERSION = "2024-11-05";
@@ -116,7 +114,7 @@ export class McpError extends Error {
     }
 }
 
-export class McpClient extends EventEmitter {
+export class McpClient {
     private proc?: child_process.ChildProcess;
     private requestId: number = 0;
     private pendingRequests: Map<RequestId, {
@@ -135,9 +133,7 @@ export class McpClient extends EventEmitter {
             version: '1.0.0'
         },
         private clientCapabilities: ClientCapabilities = {}
-    ) {
-        super();
-    }
+    ) {}
 
     public async connect(): Promise<void> {
         if (this.isConnected) {
@@ -164,8 +160,13 @@ export class McpClient extends EventEmitter {
                         const message = JSON.parse(line);
                         this.handleMessage(message);
                     } catch (error) {
-                        console.error('Failed to parse MCP message:', error);
-                        this.emit('error', new McpError(ErrorCode.ParseError, 'Failed to parse message'));
+                        const mcpError = new McpError(ErrorCode.ParseError, 'Failed to parse message');
+                        console.error('Failed to parse MCP message:', mcpError);
+                        // Reject any pending requests since we can't process the response
+                        for (const [id, pending] of this.pendingRequests) {
+                            pending.reject(mcpError);
+                            this.pendingRequests.delete(id);
+                        }
                     }
                 }
             });
@@ -177,29 +178,39 @@ export class McpClient extends EventEmitter {
 
             this.proc.on('error', (error) => {
                 this.isConnected = false;
-                this.emit('error', new McpError(ErrorCode.ConnectionClosed, error.message));
-                reject(error);
+                this.initializePromise = undefined;
+                reject(new McpError(ErrorCode.ConnectionClosed, error.message));
             });
 
             this.proc.on('close', (code) => {
                 this.isConnected = false;
                 this.initializePromise = undefined;
-                this.emit('close', code);
             });
 
-            // Wait a short moment for the process to start
-            setTimeout(() => {
-                if (!this.proc?.stdin) {
-                    reject(new McpError(ErrorCode.ConnectionClosed, 'Failed to start MCP server process'));
-                    return;
+            this.proc.on('exit', (code, signal) => {
+                this.isConnected = false;
+                this.initializePromise = undefined;
+                if (!this.proc?.killed) {
+                    reject(new McpError(
+                        ErrorCode.ConnectionClosed,
+                        `Process exited with code ${code}${signal ? ` and signal ${signal}` : ''}`
+                    ));
                 }
+            });
 
-                // Initialize connection
-                this.sendRequest('initialize', {
-                    protocolVersion: PROTOCOL_VERSION,
-                    capabilities: this.clientCapabilities,
-                    clientInfo: this.clientInfo,
-                }).then((result: any) => {
+            setTimeout(async () => {
+                try {
+                    if (!this.proc?.stdin) {
+                        throw new McpError(ErrorCode.ConnectionClosed, 'Failed to start MCP server process');
+                    }
+
+                    // Initialize connection
+                    const result = await this.sendRequest('initialize', {
+                        protocolVersion: PROTOCOL_VERSION,
+                        capabilities: this.clientCapabilities,
+                        clientInfo: this.clientInfo,
+                    });
+
                     // Verify protocol version compatibility
                     if (!this.isProtocolVersionSupported(result.protocolVersion)) {
                         throw new McpError(
@@ -215,7 +226,9 @@ export class McpClient extends EventEmitter {
                     this.sendNotification('notifications/initialized');
 
                     resolve();
-                }).catch(reject);
+                } catch (error) {
+                    reject(error);
+                }
             }, 100); // Wait 100ms for process to start
         });
 
@@ -310,7 +323,8 @@ export class McpClient extends EventEmitter {
     private handleMessage(message: McpResponse | McpNotification): void {
         // Handle notifications
         if (!('id' in message)) {
-            this.emit('notification', message);
+            // We don't handle notifications currently
+            console.debug('[MCP] Received notification:', message);
             return;
         }
 
