@@ -162,11 +162,6 @@ export class McpClient {
                     } catch (error) {
                         const mcpError = new McpError(ErrorCode.ParseError, 'Failed to parse message');
                         console.error('Failed to parse MCP message:', mcpError);
-                        // Reject any pending requests since we can't process the response
-                        for (const [id, pending] of this.pendingRequests) {
-                            pending.reject(mcpError);
-                            this.pendingRequests.delete(id);
-                        }
                     }
                 }
             });
