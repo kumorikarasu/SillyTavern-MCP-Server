@@ -139,6 +139,34 @@ async function startMcpServer(serverName: string, config: McpServerEntry) {
                 `Failed to connect to server: ${error.message}`
             );
         }
+    } else if (transportType === 'streamableHttp' || transportType === 'sse') {
+        if (!config.url) {
+            throw new McpError(
+                ErrorCode.InvalidRequest,
+                `Server "${serverName}" requires a URL for ${transportType} transport`
+            );
+        }
+        const client = new McpClient(
+            {
+                url: config.url,
+                env: config.env || {},
+                transport: transportType,
+            },
+            createClientInfo(serverName),
+            {
+                tools: { listChanged: true }
+            }
+        );
+        try {
+            await client.connect();
+            mcpClients.set(serverName, client);
+            console.log(`[MCP] Connected to server "${serverName}" using JSON-RPC with ${transportType} transport`);
+        } catch (error: any) {
+            throw new McpError(
+                ErrorCode.ConnectionClosed,
+                `Failed to connect to server: ${error.message}`
+            );
+        }
     } else {
         throw new McpError(
             ErrorCode.InvalidRequest,
@@ -253,6 +281,10 @@ export async function mcpInit(router: Router): Promise<void> {
             if (transportType === 'stdio') {
                 if (!config.command || typeof config.command !== 'string') {
                     return response.status(400).json({ error: 'Server command is required for stdio transport' });
+                }
+            } else if (transportType === 'http' || transportType === 'sse') {
+                if (!config.url || typeof config.url !== 'string') {
+                    return response.status(400).json({ error: `Server URL is required for ${transportType} transport` });
                 }
             } else {
                 return response.status(400).json({ error: `Unsupported transport type: ${transportType}` });

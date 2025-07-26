@@ -1,8 +1,10 @@
 import { Validator } from "jsonschema";
 import child_process from 'node:child_process';
+import fetch from 'node-fetch';
+import { EventSource } from 'eventsource'
 
 const JSONRPC_VERSION = "2.0";
-const PROTOCOL_VERSION = "2024-11-05";
+const PROTOCOL_VERSION = "2025-06-18";
 
 export enum ErrorCode {
     // SDK error codes
@@ -91,9 +93,13 @@ export interface McpNotification {
 }
 
 export interface McpClientConfig {
-    command: string;
+    // For stdio
+    command?: string;
     args?: string[];
     env?: Record<string, string>;
+    // For HTTP/SSE
+    url?: string;
+    transport?: 'stdio' | 'streamableHttp' | 'sse';
 }
 
 export interface Annotated {
@@ -125,6 +131,12 @@ export class McpClient {
     private isConnected: boolean = false;
     private capabilities?: ServerCapabilities;
     private initializePromise?: Promise<void>;
+    private sessionId?: string;
+    private negotiatedProtocolVersion: string = PROTOCOL_VERSION;
+    private eventSource?: EventSource;
+    private httpEndpoint?: string;
+    private postEndpoint?: string;
+    private transport: 'stdio' | 'streamableHttp' | 'sse' = 'stdio';
 
     constructor(
         private config: McpClientConfig,
@@ -133,7 +145,12 @@ export class McpClient {
             version: '1.0.0'
         },
         private clientCapabilities: ClientCapabilities = {}
-    ) {}
+    ) {
+        if (config.transport === 'streamableHttp' || config.transport === 'sse' || config.url) {
+            this.transport = config.transport === 'sse' ? 'sse' : 'streamableHttp';
+            this.httpEndpoint = config.url;
+        }
+    }
 
     public async connect(): Promise<void> {
         if (this.isConnected) {
@@ -144,90 +161,214 @@ export class McpClient {
             return this.initializePromise;
         }
 
-        this.initializePromise = new Promise((resolve, reject) => {
-            const { command, args = [], env } = this.config;
+        if (this.transport === 'stdio') {
+            this.initializePromise = new Promise((resolve, reject) => {
+                const { command, args = [], env } = this.config;
 
-            this.proc = child_process.spawn(command, args, {
-                env: { ...process.env, ...env },
-                stdio: ['pipe', 'pipe', 'pipe']
-            });
+                this.proc = child_process.spawn(command!, args, {
+                    env: { ...process.env, ...env },
+                    stdio: ['pipe', 'pipe', 'pipe']
+                });
 
-            this.proc.stdout?.on('data', (data) => {
-                const lines = data.toString().split('\n');
-                for (const line of lines) {
-                    if (!line) continue;
+                this.proc.stdout?.on('data', (data) => {
+                    const lines = data.toString().split('\n');
+                    for (const line of lines) {
+                        if (!line) continue;
+                        try {
+                            const message = JSON.parse(line);
+                            this.handleMessage(message);
+                        } catch (error) {
+                            const mcpError = new McpError(ErrorCode.ParseError, 'Failed to parse message');
+                            console.error('Failed to parse MCP message:', mcpError);
+                        }
+                    }
+                });
+
+                this.proc.stderr?.on('data', (data) => {
+                    // Log as info since these are usually initialization messages, not errors
+                    console.log(`[MCP Server] ${data}`);
+                });
+
+                this.proc.on('error', (error) => {
+                    this.isConnected = false;
+                    this.initializePromise = undefined;
+                    reject(new McpError(ErrorCode.ConnectionClosed, error.message));
+                });
+
+                this.proc.on('close', (code) => {
+                    this.isConnected = false;
+                    this.initializePromise = undefined;
+                });
+
+                this.proc.on('exit', (code, signal) => {
+                    this.isConnected = false;
+                    this.initializePromise = undefined;
+                    if (!this.proc?.killed) {
+                        reject(new McpError(
+                            ErrorCode.ConnectionClosed,
+                            `Process exited with code ${code}${signal ? ` and signal ${signal}` : ''}`
+                        ));
+                    }
+                });
+
+                setTimeout(async () => {
                     try {
-                        const message = JSON.parse(line);
-                        this.handleMessage(message);
+                        if (!this.proc?.stdin) {
+                            throw new McpError(ErrorCode.ConnectionClosed, 'Failed to start MCP server process');
+                        }
+
+                        // Initialize connection
+                        const result = await this.sendRequest('initialize', {
+                            protocolVersion: PROTOCOL_VERSION,
+                            capabilities: this.clientCapabilities,
+                            clientInfo: this.clientInfo,
+                        });
+
+                        // Verify protocol version compatibility
+                        if (!this.isProtocolVersionSupported(result.protocolVersion)) {
+                            throw new McpError(
+                                ErrorCode.UnsupportedProtocolVersion,
+                                `Server protocol version ${result.protocolVersion} is not supported`
+                            );
+                        }
+
+                        this.capabilities = result.capabilities;
+                        this.isConnected = true;
+
+                        // Send initialized notification
+                        this.sendNotification('notifications/initialized');
+
+                        resolve();
                     } catch (error) {
-                        const mcpError = new McpError(ErrorCode.ParseError, 'Failed to parse message');
-                        console.error('Failed to parse MCP message:', mcpError);
+                        reject(error);
                     }
-                }
+                }, 100); // Wait 100ms for process to start
             });
 
-            this.proc.stderr?.on('data', (data) => {
-                // Log as info since these are usually initialization messages, not errors
-                console.log(`[MCP Server] ${data}`);
-            });
-
-            this.proc.on('error', (error) => {
-                this.isConnected = false;
-                this.initializePromise = undefined;
-                reject(new McpError(ErrorCode.ConnectionClosed, error.message));
-            });
-
-            this.proc.on('close', (code) => {
-                this.isConnected = false;
-                this.initializePromise = undefined;
-            });
-
-            this.proc.on('exit', (code, signal) => {
-                this.isConnected = false;
-                this.initializePromise = undefined;
-                if (!this.proc?.killed) {
-                    reject(new McpError(
-                        ErrorCode.ConnectionClosed,
-                        `Process exited with code ${code}${signal ? ` and signal ${signal}` : ''}`
-                    ));
-                }
-            });
-
-            setTimeout(async () => {
+            return this.initializePromise;
+        } else if (this.transport === 'sse') {
+            this.initializePromise = new Promise(async (resolve, reject) => {
                 try {
-                    if (!this.proc?.stdin) {
-                        throw new McpError(ErrorCode.ConnectionClosed, 'Failed to start MCP server process');
+                    if (!this.httpEndpoint) {
+                        reject(new McpError(ErrorCode.InvalidRequest, 'No SSE endpoint URL provided'));
+                        return;
                     }
+                    const es = new EventSource(this.httpEndpoint);
+                    this.eventSource = es;
+                    es.onmessage = (event: MessageEvent) => {
+                        try {
+                            const msg = JSON.parse((event as any).data);
+                            this.handleMessage(msg);
+                        } catch (e) {
+                            console.error('Failed to parse SSE event:', e);
+                        }
+                    };
+                    es.addEventListener('endpoint', async (event: { data: string }) => {
+                        try {
+                            const httpUrl = new URL(this.httpEndpoint!);
+                            const baseUrl = httpUrl.origin + httpUrl.pathname;
 
-                    // Initialize connection
-                    const result = await this.sendRequest('initialize', {
-                        protocolVersion: PROTOCOL_VERSION,
-                        capabilities: this.clientCapabilities,
-                        clientInfo: this.clientInfo,
+                            const newUrl = new URL(event.data, baseUrl); // /messages?sessionId=123
+                            const sessionId = newUrl.searchParams.get('sessionId');
+                            if (sessionId) {
+                                this.sessionId = sessionId;
+                                const newUrlWithoutSessionId = new URL(event.data, baseUrl);
+                                newUrlWithoutSessionId.searchParams.delete('sessionId');
+                                this.postEndpoint = newUrlWithoutSessionId.href;
+
+                                this.isConnected = true;
+                                this.negotiatedProtocolVersion = PROTOCOL_VERSION; // For SSE, we assume the server supports the latest version
+                                await this.sendNotification('notifications/initialized');
+                                resolve();
+                            } else {
+                                reject(new McpError(ErrorCode.InvalidRequest, 'No sessionId found in endpoint event data'));
+                            }
+                        } catch (e) {
+                            reject(new McpError(ErrorCode.ParseError, 'Failed to parse endpoint event data'));
+                        }
                     });
-
-                    // Verify protocol version compatibility
-                    if (!this.isProtocolVersionSupported(result.protocolVersion)) {
-                        throw new McpError(
-                            ErrorCode.UnsupportedProtocolVersion,
-                            `Server protocol version ${result.protocolVersion} is not supported`
-                        );
-                    }
-
-                    this.capabilities = result.capabilities;
-                    this.isConnected = true;
-
-                    // Send initialized notification
-                    this.sendNotification('notifications/initialized');
-
-                    resolve();
-                } catch (error) {
-                    reject(error);
+                    es.onerror = (err: any) => {
+                        console.error('SSE connection error:', err);
+                    };
+                } catch (err) {
+                    reject(err);
                 }
-            }, 100); // Wait 100ms for process to start
-        });
-
-        return this.initializePromise;
+            });
+            return this.initializePromise;
+        } else if (this.transport === 'streamableHttp') {
+            this.initializePromise = new Promise(async (resolve, reject) => {
+                try {
+                    // POST initialize
+                    const headers: any = {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json, text/event-stream',
+                        'MCP-Protocol-Version': PROTOCOL_VERSION,
+                    };
+                    if (this.sessionId) {
+                        headers['Mcp-Session-Id'] = this.sessionId;
+                    }
+                    const res = await fetch(this.httpEndpoint!, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify({
+                            jsonrpc: JSONRPC_VERSION,
+                            id: ++this.requestId,
+                            method: 'initialize',
+                            params: {
+                                protocolVersion: PROTOCOL_VERSION,
+                                capabilities: this.clientCapabilities,
+                                clientInfo: this.clientInfo,
+                            }
+                        })
+                    });
+                    if (!res.ok) {
+                        const errorText = await res.text();
+                        reject(new McpError(ErrorCode.ConnectionClosed, `HTTP error: ${res.status} - ${errorText}`));
+                        return;
+                    }
+                    // Get session id if present
+                    const sessionId = res.headers.get('mcp-session-id');
+                    if (sessionId) {
+                        this.sessionId = sessionId;
+                    }
+                    const restText = await res.text();
+                    let result: any;
+                    try {
+                        result = JSON.parse(restText);
+                    } catch (e) {
+                        // Try to parse as SSE event: event: message\ndata: {...}
+                        const match = restText.match(/data: (\{[\s\S]*\})/);
+                        if (match) {
+                            try {
+                                result = JSON.parse(match[1]);
+                            } catch (e2) {
+                                reject(new McpError(ErrorCode.ParseError, 'Failed to parse SSE data as JSON'));
+                                return;
+                            }
+                        } else {
+                            reject(new McpError(ErrorCode.ParseError, 'Failed to parse initialization response as JSON or SSE'));
+                            return;
+                        }
+                    }
+                    if (!this.isProtocolVersionSupported(result.result?.protocolVersion)) {
+                        reject(new McpError(
+                            ErrorCode.UnsupportedProtocolVersion,
+                            `Server protocol version ${result.result?.protocolVersion} is not supported`
+                        ));
+                        return;
+                    }
+                    this.capabilities = result.result?.capabilities;
+                    this.isConnected = true;
+                    this.negotiatedProtocolVersion = result.result?.protocolVersion || PROTOCOL_VERSION;
+                    // Send initialized notification
+                    await this.sendNotification('notifications/initialized');
+                    resolve();
+                } catch (err) {
+                    reject(err);
+                }
+            });
+            return this.initializePromise;
+        }
     }
 
     private isProtocolVersionSupported(version: string): boolean {
@@ -237,26 +378,32 @@ export class McpClient {
     }
 
     public async close(): Promise<void> {
-        if (!this.isConnected) {
-            return;
-        }
+        if (!this.isConnected) return;
+        if (this.transport === 'stdio') {
+            return new Promise((resolve) => {
+                if (!this.proc) {
+                    resolve();
+                    return;
+                }
 
-        return new Promise((resolve) => {
-            if (!this.proc) {
-                resolve();
-                return;
-            }
+                this.proc.on('close', () => {
+                    this.isConnected = false;
+                    this.initializePromise = undefined;
+                    resolve();
+                });
 
-            this.proc.on('close', () => {
-                this.isConnected = false;
-                this.initializePromise = undefined;
-                resolve();
+                if (this.proc) {
+                    this.proc.kill();
+                }
             });
-
-            if (this.proc) {
-                this.proc.kill();
+        } else if (this.transport === 'streamableHttp' || this.transport === 'sse') {
+            if (this.eventSource) {
+                this.eventSource.close();
+                this.eventSource = undefined;
             }
-        });
+            this.isConnected = false;
+            this.initializePromise = undefined;
+        }
     }
 
     public async listTools(): Promise<any> {
@@ -269,34 +416,169 @@ export class McpClient {
     }
 
     private async sendRequest(method: string, params: any, progressToken?: ProgressToken): Promise<any> {
-        // For initialization requests, we don't want to check isConnected
-        if (method !== 'initialize' && (!this.isConnected || !this.proc?.stdin)) {
-            throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
-        }
-
-        return new Promise((resolve, reject) => {
-            const id = ++this.requestId;
-            const request: McpRequest = {
-                jsonrpc: JSONRPC_VERSION,
-                id,
-                method,
-                params: {
-                    ...params,
-                    _meta: progressToken ? { progressToken } : undefined
-                }
-            };
-
-            this.pendingRequests.set(id, { resolve, reject, method });
-
-            if (!this.proc?.stdin) {
-                throw new McpError(ErrorCode.ConnectionClosed, 'Process stdin is not available');
+        if (this.transport === 'stdio') {
+            // For initialization requests, we don't want to check isConnected
+            if (method !== 'initialize' && (!this.isConnected || !this.proc?.stdin)) {
+                throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
             }
-            this.proc.stdin.write(JSON.stringify(request) + '\n');
-        });
+
+            return new Promise((resolve, reject) => {
+                const id = ++this.requestId;
+                const request: McpRequest = {
+                    jsonrpc: JSONRPC_VERSION,
+                    id,
+                    method,
+                    params: {
+                        ...params,
+                        _meta: progressToken ? { progressToken } : undefined
+                    }
+                };
+
+                this.pendingRequests.set(id, { resolve, reject, method });
+
+                if (!this.proc?.stdin) {
+                    throw new McpError(ErrorCode.ConnectionClosed, 'Process stdin is not available');
+                }
+                this.proc.stdin.write(JSON.stringify(request) + '\n');
+            });
+        } else if (this.transport === 'sse') {
+            if (!this.isConnected) {
+                throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
+            }
+            return new Promise(async (resolve, reject) => {
+                const id = ++this.requestId;
+                const request: McpRequest = {
+                    jsonrpc: JSONRPC_VERSION,
+                    id,
+                    method,
+                    params: {
+                        ...params,
+                        _meta: progressToken ? { progressToken } : undefined
+                    }
+                };
+                this.pendingRequests.set(id, { resolve, reject, method });
+                const headers: any = {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json, text/event-stream',
+                    'MCP-Protocol-Version': this.negotiatedProtocolVersion,
+                };
+                // For sse transport, POST to postEndpoint (or httpEndpoint) with sessionId as query param
+                let postUrl = this.postEndpoint || this.httpEndpoint;
+                if (!postUrl) {
+                    reject(new McpError(ErrorCode.ConnectionClosed, 'No POST endpoint configured for SSE transport'));
+                    return;
+                }
+                const urlObj = new URL(postUrl);
+                if (this.sessionId) {
+                    // Add sessionId as query param
+                    urlObj.searchParams.set('sessionId', this.sessionId);
+                }
+                try {
+                    const res = await fetch(urlObj.href, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify(request)
+                    });
+                    if (!res.ok) {
+                        const errorText = await res.text();
+                        reject(new McpError(ErrorCode.ConnectionClosed, `HTTP error: ${res.status} - ${errorText}`));
+                        return;
+                    }
+                } catch (err) {
+                    reject(err);
+                }
+            });
+        }
+        else if (this.transport === 'streamableHttp') {
+            if (!this.isConnected) {
+                throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
+            }
+            return new Promise(async (resolve, reject) => {
+                const id = ++this.requestId;
+                const request: McpRequest = {
+                    jsonrpc: JSONRPC_VERSION,
+                    id,
+                    method,
+                    params: {
+                        ...params,
+                        _meta: progressToken ? { progressToken } : undefined
+                    }
+                };
+                this.pendingRequests.set(id, { resolve, reject, method });
+                const headers: any = {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json, text/event-stream',
+                    'MCP-Protocol-Version': this.negotiatedProtocolVersion,
+                };
+                if (this.sessionId) {
+                    headers['Mcp-Session-Id'] = this.sessionId;
+                }
+                let res;
+                try {
+                    res = await fetch(this.httpEndpoint!, {
+                        method: 'POST',
+                        headers,
+                        body: JSON.stringify(request)
+                    });
+                } catch (err) {
+                    reject(new McpError(ErrorCode.ConnectionClosed, 'Network error: ' + (err as Error).message));
+                    return;
+                }
+                // Handle session expired (404) per spec
+                if (res.status === 404 && this.sessionId) {
+                    // Session expired, clear and re-initialize
+                    this.sessionId = undefined;
+                    this.isConnected = false;
+                    this.initializePromise = undefined;
+                    try {
+                        await this.connect();
+                        // Retry the request after re-initialization
+                        resolve(await this.sendRequest(method, params, progressToken));
+                    } catch (e) {
+                        reject(new McpError(ErrorCode.ConnectionClosed, 'Session expired and re-initialization failed'));
+                    }
+                    return;
+                }
+
+                const contentType = res.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {
+                    const result: any = await res.json();
+                    this.handleMessage(result);
+                } else if (contentType.includes('text/event-stream')) {
+                    // Parse SSE stream directly from POST response body
+                    const body = res.body;
+                    if (!body || typeof body[Symbol.asyncIterator] !== 'function') {
+                        reject(new McpError(ErrorCode.ConnectionClosed, 'No stream available for SSE response'));
+                        return;
+                    }
+                    let buffer = '';
+                    for await (const chunk of body as AsyncIterable<Buffer | string>) {
+                        const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk;
+                        buffer += text;
+                        let lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
+                        for (const line of lines) {
+                            const trimmed = line.trim();
+                            if (trimmed.startsWith('data:')) {
+                                try {
+                                    const json = JSON.parse(trimmed.slice(5).trim());
+                                    this.handleMessage(json);
+                                } catch (e) {
+                                    console.error('Failed to parse SSE data:', e);
+                                }
+                            }
+                        }
+                    }
+                    resolve(undefined);
+                } else {
+                    reject(new McpError(ErrorCode.ConnectionClosed, `Unexpected content-type: ${contentType}`));
+                }
+            });
+        }
     }
 
-    private sendNotification(method: string, params?: any): void {
-        if (!this.isConnected || !this.proc?.stdin) {
+    private async sendNotification(method: string, params?: any): Promise<void> {
+        if (!this.isConnected) {
             throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
         }
 
@@ -309,10 +591,26 @@ export class McpClient {
             } : undefined
         };
 
-        if (!this.proc?.stdin) {
-            throw new McpError(ErrorCode.ConnectionClosed, 'Process stdin is not available');
+        if (this.transport === 'stdio') {
+            if (!this.proc?.stdin) {
+                throw new McpError(ErrorCode.ConnectionClosed, 'Process stdin is not available');
+            }
+            this.proc.stdin.write(JSON.stringify(notification) + '\n');
+        } else if (this.transport === 'streamableHttp') {
+            const headers: any = {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json, text/event-stream',
+                'MCP-Protocol-Version': this.negotiatedProtocolVersion,
+            };
+            if (this.sessionId) {
+                headers['Mcp-Session-Id'] = this.sessionId;
+            }
+            await fetch(this.httpEndpoint!, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(notification)
+            });
         }
-        this.proc.stdin.write(JSON.stringify(notification) + '\n');
     }
 
     private handleMessage(message: McpResponse | McpNotification): void {

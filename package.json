@@ -6,7 +6,9 @@
     "type": "commonjs",
     "scripts": {
         "dev": "webpack --mode development",
-        "build": "webpack --mode production"
+        "build": "webpack --mode production",
+        "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+        "prettify": "prettier --write \"src/**/*.ts\""
     },
     "repository": {
         "type": "git",
@@ -25,6 +27,7 @@
         "@eslint/js": "^9.17.0",
         "@types/express": "^5.0.0",
         "@types/write-file-atomic": "^4.0.3",
+        "prettier": "^3.6.2",
         "terser-webpack-plugin": "^5.3.11",
         "ts-loader": "^9.5.1",
         "typescript": "^5.7.2",
@@ -34,7 +37,9 @@
         "webpack-cli": "^6.0.1"
     },
     "dependencies": {
+        "eventsource": "^4.0.0",
         "jsonschema": "^1.5.0",
+        "node-fetch": "^3.3.2",
         "write-file-atomic": "^6.0.0"
     }
 }
