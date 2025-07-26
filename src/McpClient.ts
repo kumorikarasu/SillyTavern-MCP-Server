@@ -150,7 +150,15 @@ export class McpClient {
     private clientCapabilities: ClientCapabilities = {},
   ) {
     if (config.transport === 'streamableHttp' || config.transport === 'sse' || config.url) {
-      this.transport = config.transport === 'sse' ? 'sse' : 'streamableHttp';
+      if (config.transport) {
+        this.transport = config.transport;
+      } else if (config.url) {
+        if (config.url?.includes('sse')) {
+          this.transport = 'sse';
+        } else {
+          this.transport = 'streamableHttp';
+        }
+      }
       this.httpEndpoint = config.url;
     }
   }
