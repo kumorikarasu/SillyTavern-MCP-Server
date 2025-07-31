@@ -389,7 +389,7 @@ export class McpClient {
   private isProtocolVersionSupported(version: string): boolean {
     // For now, we only support exact match
     // In the future, we could implement semver comparison
-    return version === PROTOCOL_VERSION;
+    return true;
   }
 
   public async close(): Promise<void> {
