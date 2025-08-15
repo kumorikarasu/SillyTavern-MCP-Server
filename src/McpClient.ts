@@ -268,6 +268,11 @@ export class McpClient {
           }
           const es = new EventSource(this.httpEndpoint);
           this.eventSource = es;
+          
+          es.onopen = () => {
+            // SSE connection opened
+          };
+          
           es.onmessage = (event: MessageEvent) => {
             try {
               const msg = JSON.parse((event as any).data);
@@ -276,6 +281,7 @@ export class McpClient {
               console.error('Failed to parse SSE event:', e);
             }
           };
+          
           es.addEventListener('endpoint', async (event: { data: string }) => {
             try {
               const httpUrl = new URL(this.httpEndpoint!);
@@ -289,8 +295,26 @@ export class McpClient {
                 newUrlWithoutSessionId.searchParams.delete('sessionId');
                 this.postEndpoint = newUrlWithoutSessionId.href;
 
+                // Send proper MCP initialization sequence per protocol spec
+                const initResult = await this.sendRequest('initialize', {
+                  protocolVersion: PROTOCOL_VERSION,
+                  capabilities: this.clientCapabilities,
+                  clientInfo: this.clientInfo,
+                });
+                
+                // Verify protocol version compatibility
+                if (!this.isProtocolVersionSupported(initResult.protocolVersion)) {
+                  reject(new McpError(
+                    ErrorCode.UnsupportedProtocolVersion,
+                    `Server protocol version ${initResult.protocolVersion} is not supported`
+                  ));
+                  return;
+                }
+                
+                this.capabilities = initResult.capabilities;
                 this.isConnected = true;
-                this.negotiatedProtocolVersion = PROTOCOL_VERSION; // For SSE, we assume the server supports the latest version
+                this.negotiatedProtocolVersion = initResult.protocolVersion || PROTOCOL_VERSION;
+                
                 await this.sendNotification('notifications/initialized');
                 resolve();
               } else {
@@ -457,7 +481,8 @@ export class McpClient {
         this.proc.stdin.write(JSON.stringify(request) + '\n');
       });
     } else if (this.transport === 'sse') {
-      if (!this.isConnected) {
+      // For initialization requests, we don't want to check isConnected
+      if (method !== 'initialize' && !this.isConnected) {
         throw new McpError(ErrorCode.ConnectionClosed, 'MCP client is not connected');
       }
       return new Promise(async (resolve, reject) => {
@@ -612,6 +637,29 @@ export class McpClient {
         throw new McpError(ErrorCode.ConnectionClosed, 'Process stdin is not available');
       }
       this.proc.stdin.write(JSON.stringify(notification) + '\n');
+    } else if (this.transport === 'sse') {
+      // For SSE transport, send notifications via POST endpoint just like requests
+      let postUrl = this.postEndpoint || this.httpEndpoint;
+      if (!postUrl) {
+        throw new McpError(ErrorCode.ConnectionClosed, 'No POST endpoint configured for SSE transport');
+      }
+      const urlObj = new URL(postUrl);
+      if (this.sessionId) {
+        // Add sessionId as query param
+        urlObj.searchParams.set('sessionId', this.sessionId);
+      }
+      
+      const headers: any = {
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': this.negotiatedProtocolVersion,
+      };
+      
+      await fetch(urlObj.href, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(notification),
+      });
     } else if (this.transport === 'streamableHttp') {
       const headers: any = {
         'Content-Type': 'application/json',

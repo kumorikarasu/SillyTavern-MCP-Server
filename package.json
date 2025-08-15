@@ -38,6 +38,7 @@
     },
     "dependencies": {
         "eventsource": "^4.0.0",
+        "express": "^5.1.0",
         "jsonschema": "^1.5.0",
         "node-fetch": "^3.3.2",
         "write-file-atomic": "^6.0.0"
